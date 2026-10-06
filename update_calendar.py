@@ -1,6 +1,6 @@
 import re
-from datetime import date, datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse, parse_qs
+import hashlib
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from icalendar import Calendar, Event
@@ -10,18 +10,17 @@ from playwright.sync_api import sync_playwright
 BASE_URL = "https://www.akb48.co.jp"
 SCHEDULE_URL = f"{BASE_URL}/about/schedule"
 
-# この3種類だけAppleカレンダーに入れる
 KEYWORDS = (
     "握手会",
     "写真会",
     "オンラインお話し会",
     "コンサート",
     "LIVE",
-    "Live",
     "ライブ",
+    "TOUR",
+    "ツアー",
 )
 
-# 今月から何か月先まで確認するか
 MONTHS_AHEAD = 18
 
 
@@ -31,357 +30,427 @@ def add_months(d, months):
     return date(year, month, 1)
 
 
-def event_id_from_url(url):
-    query = parse_qs(urlparse(url).query)
-    return query.get("id", [url])[0]
+def clean_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def find_event_date(text, target_month):
-    # 例：2027年1月9日
+def parse_date_text(value):
+    if value is None:
+        return None
+
+    text = str(value)
+
     m = re.search(
-        r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日",
-        text
-    )
-
-    if m:
-        try:
-            return date(
-                int(m.group(1)),
-                int(m.group(2)),
-                int(m.group(3))
-            )
-        except ValueError:
-            pass
-
-    # 例：1/9
-    matches = re.finditer(
-        r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)",
-        text
-    )
-
-    for m in matches:
-        month = int(m.group(1))
-        day = int(m.group(2))
-
-        if month == target_month.month:
-            try:
-                return date(target_month.year, month, day)
-            except ValueError:
-                pass
-
-    return None
-
-
-def find_time(text):
-    # 例：10:30～19:15
-    m = re.search(
-        r"([01]?\d|2[0-3]):([0-5]\d)"
-        r"\s*(?:-|–|—|〜|～|~)\s*"
-        r"([01]?\d|2[0-3]):([0-5]\d)",
-        text
+        r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})",
+        text,
     )
 
     if not m:
         return None
 
-    return (
-        int(m.group(1)),
-        int(m.group(2)),
-        int(m.group(3)),
-        int(m.group(4)),
+    try:
+        return date(
+            int(m.group(1)),
+            int(m.group(2)),
+            int(m.group(3)),
+        )
+    except ValueError:
+        return None
+
+
+def parse_datetime_text(value, jst):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    try:
+        dt = datetime.fromisoformat(
+            text.replace("Z", "+00:00")
+        )
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=jst)
+
+        return dt.astimezone(jst)
+
+    except ValueError:
+        pass
+
+    m = re.search(
+        r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})"
+        r"(?:[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?",
+        text,
+    )
+
+    if not m:
+        return None
+
+    try:
+        return datetime(
+            int(m.group(1)),
+            int(m.group(2)),
+            int(m.group(3)),
+            int(m.group(4) or 0),
+            int(m.group(5) or 0),
+            int(m.group(6) or 0),
+            tzinfo=jst,
+        )
+    except ValueError:
+        return None
+
+
+def is_target_title(title):
+    title = title.casefold()
+
+    return any(
+        keyword.casefold() in title
+        for keyword in KEYWORDS
     )
 
 
-def find_location(title):
+def collect_schedule_items(obj, out):
+    if isinstance(obj, dict):
+
+        title = clean_text(
+            obj.get("title")
+        )
+
+        event_date = parse_date_text(
+            obj.get("date")
+        )
+
+        if (
+            title
+            and event_date
+            and is_target_title(title)
+        ):
+            out.append(obj)
+
+        for value in obj.values():
+            collect_schedule_items(
+                value,
+                out,
+            )
+
+    elif isinstance(obj, list):
+
+        for value in obj:
+            collect_schedule_items(
+                value,
+                out,
+            )
+
+
+def get_item_id(item, title, event_date):
+    for key in (
+        "id",
+        "schedule_id",
+        "scheduleId",
+    ):
+        value = item.get(key)
+
+        if value not in (None, ""):
+            return str(value)
+
+    raw = (
+        f"{event_date.isoformat()}|"
+        f"{title}"
+    )
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def get_location(item, title):
+
+    for key in (
+        "place",
+        "location",
+        "venue",
+    ):
+        value = clean_text(
+            item.get(key)
+        )
+
+        if value:
+            return value
+
     if "オンライン" in title:
         return "オンライン"
 
-    # 「@幕張メッセ」など
-    m = re.search(r"[@＠]\s*(.+)$", title)
+    m = re.search(
+        r"[@＠]\s*(.+)$",
+        title,
+    )
 
     if m:
-        return m.group(1).strip()
+        return clean_text(
+            m.group(1)
+        )
 
     return ""
 
 
 def main():
 
-    jst = ZoneInfo("Asia/Tokyo")
-    today = datetime.now(jst).date()
-
-    first_month = date(
-        today.year,
-        today.month,
-        1
+    jst = ZoneInfo(
+        "Asia/Tokyo"
     )
 
-    found = {}
+    today = datetime.now(
+        jst
+    ).date()
+
+    this_month = date(
+        today.year,
+        today.month,
+        1,
+    )
+
+    raw_items = []
+    json_urls = set()
 
     with sync_playwright() as p:
 
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True
+        )
 
         page = browser.new_page(
             locale="ja-JP",
-            timezone_id="Asia/Tokyo"
+            timezone_id="Asia/Tokyo",
         )
 
-        # -------------------------
-        # 公式SCHEDULEを18か月確認
-        # -------------------------
+        def handle_response(response):
 
-        for i in range(MONTHS_AHEAD):
+            # SCHEDULEが裏で取得した
+            # JSONデータを見る
+            if response.request.resource_type not in (
+                "xhr",
+                "fetch",
+            ):
+                return
 
-            month = add_months(first_month, i)
+            try:
+                data = response.json()
+            except Exception:
+                return
+
+            json_urls.add(
+                response.url
+            )
+
+            collect_schedule_items(
+                data,
+                raw_items,
+            )
+
+        page.on(
+            "response",
+            handle_response,
+        )
+
+        for i in range(
+            MONTHS_AHEAD
+        ):
+
+            month = add_months(
+                this_month,
+                i,
+            )
 
             url = (
                 f"{SCHEDULE_URL}"
                 f"?date={month.isoformat()}"
             )
 
-            print("確認:", url)
+            print(
+                "確認:",
+                url,
+            )
 
             page.goto(
                 url,
-                wait_until="domcontentloaded"
+                wait_until="domcontentloaded",
+                timeout=60000,
             )
 
-            page.wait_for_timeout(2500)
-
-            links = page.locator("a").evaluate_all(
-                """
-                elements => elements.map(a => ({
-                    href: a.href || "",
-                    text: (
-                        a.innerText ||
-                        a.textContent ||
-                        ""
-                    ).trim()
-                }))
-                .filter(x =>
-                    x.href.includes("/about/schedule")
-                    &&
-                    x.href.includes("id=")
-                )
-                """
+            page.wait_for_timeout(
+                3000
             )
-
-            for item in links:
-
-                title = re.sub(
-                    r"\s+",
-                    " ",
-                    item["text"]
-                ).strip()
-
-                if not title:
-                    continue
-
-                # 対象イベントだけ残す
-                if not any(
-                    keyword in title
-                    for keyword in KEYWORDS
-                ):
-                    continue
-
-                href = urljoin(
-                    BASE_URL,
-                    item["href"]
-                )
-
-                eid = event_id_from_url(href)
-
-                # 同じschedule IDは1件だけ
-                if eid not in found:
-
-                    found[eid] = {
-                        "id": eid,
-                        "title": title,
-                        "url": href,
-                        "month": month,
-                    }
-
-        print(
-            "対象イベント候補:",
-            len(found)
-        )
-
-        if not found:
-            raise RuntimeError(
-                "対象イベントが0件でした。"
-                "calendar.icsを上書きしません。"
-            )
-
-        # -------------------------
-        # 各イベント詳細を読む
-        # -------------------------
-
-        events = []
-
-        detail = browser.new_page(
-            locale="ja-JP",
-            timezone_id="Asia/Tokyo"
-        )
-
-        for item in found.values():
-
-            print(
-                "詳細確認:",
-                item["title"]
-            )
-
-            detail.goto(
-                item["url"],
-                wait_until="domcontentloaded"
-            )
-
-            detail.wait_for_timeout(2000)
-
-            text = detail.locator(
-                "body"
-            ).inner_text()
-
-            event_date = find_event_date(
-                text,
-                item["month"]
-            )
-
-            if not event_date:
-                print(
-                    "日付取得失敗:",
-                    item["url"]
-                )
-                continue
-
-            time_data = find_time(text)
-
-            events.append({
-                **item,
-                "date": event_date,
-                "time": time_data,
-                "location": find_location(
-                    item["title"]
-                ),
-            })
 
         browser.close()
 
-    # -------------------------
-    # Appleカレンダー用ICS
-    # -------------------------
+    print(
+        "SCHEDULEデータ取得先:",
+        len(json_urls),
+    )
+
+    events_by_key = {}
+
+    for item in raw_items:
+
+        title = clean_text(
+            item.get("title")
+        )
+
+        event_date = parse_date_text(
+            item.get("date")
+        )
+
+        if not title or not event_date:
+            continue
+
+        # 過去はAppleカレンダーに入れない
+        if event_date < today:
+            continue
+
+        item_id = get_item_id(
+            item,
+            title,
+            event_date,
+        )
+
+        key = (
+            f"{item_id}|"
+            f"{event_date.isoformat()}"
+        )
+
+        events_by_key[key] = {
+            "id": item_id,
+            "title": title,
+            "date": event_date,
+            "start": item.get("date"),
+            "end": item.get("end_date"),
+            "location": get_location(
+                item,
+                title,
+            ),
+        }
+
+    events = sorted(
+        events_by_key.values(),
+        key=lambda x: (
+            x["date"],
+            x["title"],
+        ),
+    )
+
+    print(
+        "今日以降の対象予定:",
+        len(events),
+    )
 
     cal = Calendar()
 
     cal.add(
         "prodid",
-        "-//AKB48 Schedule Calendar//JA"
+        "-//AKB48 Schedule Calendar//JA",
     )
 
     cal.add(
         "version",
-        "2.0"
+        "2.0",
     )
 
     cal.add(
         "x-wr-calname",
-        "AKB48 握手会・写真会・オンラインお話し会"
+        "AKB48 コンサート・握手会・写真会・オンラインお話し会",
     )
 
     cal.add(
         "x-wr-timezone",
-        "Asia/Tokyo"
+        "Asia/Tokyo",
     )
 
-    for item in sorted(
-        events,
-        key=lambda x: x["date"]
-    ):
+    for item in events:
 
         ev = Event()
 
         ev.add(
             "uid",
-            f"akb48-{item['id']}@schedule"
+            (
+                f"akb48-"
+                f"{item['id']}-"
+                f"{item['date'].isoformat()}"
+                f"@schedule"
+            ),
         )
 
         ev.add(
             "summary",
-            item["title"]
+            item["title"],
         )
 
-        # 毎回変化しないようイベント日を使用
-        ev.add(
-            "dtstamp",
-            datetime(
-                item["date"].year,
-                item["date"].month,
-                item["date"].day,
-                tzinfo=timezone.utc
+        start = parse_datetime_text(
+            item["start"],
+            jst,
+        )
+
+        end = parse_datetime_text(
+            item["end"],
+            jst,
+        )
+
+        has_time = (
+            start is not None
+            and (
+                start.hour != 0
+                or start.minute != 0
             )
         )
 
-        if item["time"]:
+        if has_time:
 
-            sh, sm, eh, em = item["time"]
-
-            start = datetime(
-                item["date"].year,
-                item["date"].month,
-                item["date"].day,
-                sh,
-                sm,
-                tzinfo=jst
+            ev.add(
+                "dtstart",
+                start,
             )
 
-            end = datetime(
-                item["date"].year,
-                item["date"].month,
-                item["date"].day,
-                eh,
-                em,
-                tzinfo=jst
-            )
-
-            ev.add("dtstart", start)
-            ev.add("dtend", end)
+            if end and end > start:
+                ev.add(
+                    "dtend",
+                    end,
+                )
+            else:
+                ev.add(
+                    "dtend",
+                    start
+                    + timedelta(hours=1),
+                )
 
         else:
 
-            # 時間が取れない場合は終日予定
             ev.add(
                 "dtstart",
-                item["date"]
+                item["date"],
             )
 
             ev.add(
                 "dtend",
                 item["date"]
-                + timedelta(days=1)
+                + timedelta(days=1),
             )
 
         if item["location"]:
             ev.add(
                 "location",
-                item["location"]
+                item["location"],
             )
 
         ev.add(
             "description",
-            "AKB48公式SCHEDULEから自動取得\n"
-            + item["url"]
-        )
-
-        ev.add(
-            "url",
-            item["url"]
+            "AKB48公式SCHEDULEから自動取得",
         )
 
         cal.add_component(ev)
 
+    # 0件でも正常に作る
     with open(
         "calendar.ics",
-        "wb"
+        "wb",
     ) as f:
 
         f.write(
@@ -391,7 +460,7 @@ def main():
     print(
         "calendar.ics作成完了:",
         len(events),
-        "件"
+        "件",
     )
 
 
