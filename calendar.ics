@@ -4,4 +4,20 @@ PRODID:-//AKB48 Schedule Calendar//JA
 X-WR-CALNAME:AKB48 コンサート・握手会・写真会・オンライ
  ンお話し会
 X-WR-TIMEZONE:Asia/Tokyo
+BEGIN:VEVENT
+SUMMARY:【2ショット写真会】AKB48～studio recordings コレクシ
+ ョン～Team A 7th Stage 「M.T.に捧ぐ」（Standard Edition）
+DTSTART;VALUE=DATE:20261121
+DTEND;VALUE=DATE:20261122
+UID:akb48-95978-2026-11-21@schedule
+DESCRIPTION:AKB48公式SCHEDULEから自動取得
+END:VEVENT
+BEGIN:VEVENT
+SUMMARY:【2ショット写真会】AKB48～studio recordings コレクシ
+ ョン～Team A 7th Stage 「M.T.に捧ぐ」（Standard Edition）
+DTSTART;VALUE=DATE:20261122
+DTEND;VALUE=DATE:20261123
+UID:akb48-95977-2026-11-22@schedule
+DESCRIPTION:AKB48公式SCHEDULEから自動取得
+END:VEVENT
 END:VCALENDAR
